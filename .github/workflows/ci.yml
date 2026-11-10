@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test on node@${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The oldest node engines.node claims, plus current LTS. An untested
+        # floor is a guess — every Dockerfile here is node 24.
+        node: ["22", "lts/*"]
+    steps:
+      - name: Checkout 🛎️
+        uses: actions/checkout@v5
+      - name: Setup pnpm 🔧
+        uses: pnpm/action-setup@v6
+      - name: Setup node 🔧
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          check-latest: true
+          cache: "pnpm"
+      - name: Install 🪄
+        run: pnpm install --frozen-lockfile
+      - name: Lint 🔍
+        run: pnpm run lint
+      - name: Format 🔍
+        run: pnpm run format:check
+      - name: TypeScript 🔍
+        run: pnpm run typecheck
+      - name: Test 🧪
+        run: pnpm run test
+      - name: Build 📦
+        run: pnpm run build
+      # Every client config in the wild spells this server `npx -y <package>`,
+      # and npx picks the bin by name: it only forgives a mismatch while the
+      # package ships exactly one. So the day a second bin is added, that
+      # command starts failing with "could not determine executable to run" —
+      # at the client, with stderr swallowed, long after CI was green. Mirrors
+      # npm's own getBinFromManifest, so it fails here first instead.
+      - name: npx can resolve a bin 🔒
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            const bin = pkg.bin ?? {};
+            const unscoped = pkg.name.slice(pkg.name.indexOf('/') + 1);
+            if (new Set(Object.values(bin)).size > 1 && !bin[unscoped]) {
+              console.error('npx cannot pick a bin for ' + pkg.name + ': none of [' +
+                Object.keys(bin).join(', ') + '] is named ' + unscoped + '.');
+              console.error('Add a ' + unscoped + ' alias pointing at the server entry point.');
+              process.exit(1);
+            }
+          "
+      # The tool list is the server's public contract, and it is easy to change
+      # by accident. This asserts the built CLI still speaks MCP over stdio, and
+      # that an unconfigured capability is absent rather than merely refused.
+      # The tool list is the server's public contract and is easy to change by
+      # accident. Three phases, because the negative check in phase 2 passes
+      # vacuously if a tool is renamed — phase 3 is what stops that.
+      #
+      # HOME is pointed at nothing so the runner's own dotfiles can never be
+      # picked up. For any server that reads one (~/.npmrc, ~/.aws/credentials),
+      # omitting this tests a different server than an unconfigured user gets.
+      - name: MCP smoke test 🧪
+        run: |
+          list_tools() {
+            printf '%s\n' \
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+              '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | env HOME=/nonexistent YOUTUBE_CONFIG=/nonexistent.json "$@" node dist/cli.js 2>/dev/null
+          }
+
+          # 1. With nothing configured the server must still speak MCP. One that
+          #    exits here shows in the client as a bare "Connection closed" with
+          #    stderr swallowed, so nothing explains what to set.
+          list_tools > /tmp/unconfigured.json
+          grep -q '"name":"youtube_auth_status"' /tmp/unconfigured.json \
+            || { echo "youtube_auth_status missing from an unconfigured server"; exit 1; }
+
+          # 2. With credentials but no write flag, the gated tools must be
+          #    ABSENT — not merely refused.
+          list_tools YOUTUBE_CLIENT_ID=ci-fake YOUTUBE_CLIENT_SECRET=ci-fake > /tmp/readonly.json
+          #    Every verb this server writes with, upload first: it is the one
+          #    that publishes to the internet.
+          ! grep -qE '"name":"youtube_(upload|create|update|delete|set|add)_' /tmp/readonly.json \
+            || { echo "write tools leaked without YOUTUBE_ALLOW_WRITES"; exit 1; }
+          grep -q '"name":"youtube_list_videos"' /tmp/readonly.json \
+            || { echo "read tools missing with an OAuth client configured"; exit 1; }
+
+          # 3. Turning the flag ON must only ever ADD. A gate written the wrong
+          #    way round (`if (allowWrites) return;`) makes read tools vanish
+          #    instead, which phase 2 cannot see — it only looks for extras.
+          #    This invariant holds even before any write tool exists, so it is
+          #    safe on a fresh scaffold.
+          list_tools YOUTUBE_CLIENT_ID=ci-fake YOUTUBE_CLIENT_SECRET=ci-fake YOUTUBE_ALLOW_WRITES=1 > /tmp/writes.json
+          # [a-z0-9_], not [a-z_]: a prefix with a digit in it — `a2a_`, `s3_`,
+          # `oauth2_` — matches NOTHING under the narrower class, and then every
+          # assertion below passes vacuously, including the one that exists to catch
+          # a write tool leaking past its gate. Found in mcp-a2a, where all three
+          # phases were green and checking nothing.
+          grep -o '"name":"youtube_[a-z0-9_]*"' /tmp/readonly.json | sort -u > /tmp/a.txt
+          grep -o '"name":"youtube_[a-z0-9_]*"' /tmp/writes.json | sort -u > /tmp/b.txt
+          # And fail loudly if the pattern stops matching, rather than passing.
+          [ -s /tmp/a.txt ] \
+            || { echo "the tool-name pattern matched nothing — has the prefix changed?"; exit 1; }
+          missing=$(comm -23 /tmp/a.txt /tmp/b.txt)
+          [ -z "$missing" ] \
+            || { echo "these tools disappeared when writes were enabled: $missing"; exit 1; }
+          echo "smoke test ok: $(wc -l < /tmp/a.txt) read tools, $(comm -13 /tmp/a.txt /tmp/b.txt | wc -l) added by the write gate"
+
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    # id-token: write is required for OIDC trusted publishing + provenance
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout 🛎️
+        uses: actions/checkout@v5
+      - name: Setup pnpm 🔧
+        uses: pnpm/action-setup@v6
+      - name: Setup node 🔧
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: "pnpm"
+          registry-url: https://registry.npmjs.org
+      - name: Install 🪄
+        run: pnpm install --frozen-lockfile
+      - name: Upgrade npm 🔧
+        # OIDC trusted publishing needs a recent npm CLI
+        run: npm install -g npm@latest
+      # A version already on npm cannot be republished, so re-running this job
+      # would fail on a duplicate. Skip instead, so pushing a tag is always safe.
+      - name: Check npm for this version 🔍
+        id: published
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$name@$version is already published — skipping publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish 🚀
+        if: steps.published.outputs.exists == 'false'
+        run: npm publish --provenance --access public
+
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout 🛎️
+        uses: actions/checkout@v5
+      - name: Create release 🏷️
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
