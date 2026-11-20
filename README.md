@@ -51,6 +51,12 @@ restart afterwards.
 Environment first, then `~/.config/youtube/config.json` (camelCase keys, strict), field by
 field.
 
+A bad setting never stops the server from starting. An out-of-range number is clamped and an
+unreadable one falls back; both are listed under `config_issues` in `youtube_auth_status` and on
+stderr. A config file that cannot be used (bad JSON, an unknown key) is ignored whole, and
+because it may hold the channel guard, every data and write tool then refuses (`locked`) until
+it is fixed or `YOUTUBE_CHANNEL_ID` is set in the environment.
+
 | Variable                | Required | Description                                                                        |
 | ----------------------- | -------- | ---------------------------------------------------------------------------------- |
 | `YOUTUBE_CLIENT_ID`     | yes      | Desktop-app OAuth client id (`….apps.googleusercontent.com`).                      |

@@ -1,3 +1,7 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { CHANNEL, CLIENT_ENV, connect, jsonResponse, WRITE_ENV, type Route } from "#test/helpers";
@@ -35,6 +39,16 @@ describe("with no credentials configured", () => {
     expect(res.signedIn).toBe(false);
     expect((res.setup as string[]).join(" ")).toContain("YOUTUBE_CLIENT_ID");
     expect((res.setup as string[]).join(" ")).toContain("Desktop app");
+  });
+
+  it("reports a clamped setting in youtube_auth_status, configured or not", async () => {
+    for (const env of [{}, CLIENT_ENV]) {
+      const res = await (
+        await connect({ ...env, YOUTUBE_MAX_RETRIES: "20" })
+      ).call("youtube_auth_status");
+      expect(res.config_issues).toEqual(["YOUTUBE_MAX_RETRIES=20 is outside 0-10; using 10."]);
+    }
+    expect((await (await connect({})).call("youtube_auth_status")).config_issues).toBeUndefined();
   });
 
   it("answers youtube_auth_login with the setup steps rather than failing obscurely", async () => {
@@ -126,6 +140,24 @@ describe("the channel guard (rule 11)", () => {
     expect(res.remedy).toContain("youtube_auth_login");
     // Only the identity lookup went out — never the playlist read.
     expect(h.calls.map((c) => c.url.pathname)).toEqual(["/youtube/v3/channels"]);
+  });
+
+  it("refuses everything, sending nothing, while a broken config file is ignored", async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "mcp-youtube-lock-")), "config.json");
+    writeFileSync(path, "{ not json", { mode: 0o600 });
+    const h = await connect(WRITE_ENV, { configPath: path });
+    for (const [tool, args] of [
+      ["youtube_list_playlists", {}],
+      ["youtube_delete_video", { video_id: "dQw4w9WgXcQ", confirm: true }],
+    ] as const) {
+      const res = await h.call(tool, args);
+      expect(res.isToolError, tool).toBe(true);
+      expect(String(res.error)).toContain("could not be used");
+    }
+    expect(h.calls).toHaveLength(0);
+    const status = await h.call("youtube_auth_status");
+    expect(String(status.locked)).toContain("YOUTUBE_CHANNEL_ID");
+    expect((status.config_issues as string[]).join(" ")).toContain("not valid JSON");
   });
 });
 

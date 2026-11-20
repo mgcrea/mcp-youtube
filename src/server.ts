@@ -110,6 +110,7 @@ export const createServer = (opts: CreateServerOptions): CreatedServer => {
     timeoutMs: config.timeoutMs,
     userAgent: USER_AGENT,
     expectedChannelId: config.channelId,
+    lockedReason: config.lockedReason,
     fetch: fetchImpl,
     ...(opts.logger ? { logger: opts.logger } : {}),
   });

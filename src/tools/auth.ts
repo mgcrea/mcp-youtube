@@ -34,19 +34,27 @@ export const registerAuthTools = (
         "Whether the server is configured and signed in, which channel the token acts as (the " +
         "token picks the channel, so this is where uploads land), the granted scopes, whether " +
         "write tools are registered, and the daily quota model. When unconfigured, returns the " +
-        "exact setup steps. Call this first when a tool you expected is missing. Costs 1 quota " +
+        "exact setup steps. Call this first when a tool you expected is missing, or a setting seems " +
+        "to have no effect (`config_issues` lists values that were clamped or ignored). Costs 1 quota " +
         "unit the first time it resolves the channel, then nothing.",
       inputSchema: z.object({}),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async () =>
       wrap(async () => {
+        // Clamped or ignored settings, in both replies: a value that "had no effect" is
+        // exactly what someone calls this tool to find out about.
+        const issues = {
+          ...(ctx.config.issues.length > 0 ? { config_issues: ctx.config.issues } : {}),
+          ...(ctx.config.lockedReason ? { locked: ctx.config.lockedReason } : {}),
+        };
         if (!ctx.hasCredentials) {
           return {
             configured: false,
             signedIn: false,
             available_without_credentials: available,
             setup: setupInstructions(ctx.config),
+            ...issues,
           };
         }
         const status = ctx.auth.tokenProvider.describe();
@@ -67,6 +75,7 @@ export const registerAuthTools = (
         const lastError = ctx.auth.lastError();
         return {
           configured: true,
+          ...issues,
           signedIn: status.signedIn,
           ...(status.signedIn
             ? {

@@ -95,6 +95,8 @@ export type YoutubeClientOptions = {
   userAgent: string;
   /** Refuse to act when the token resolves to a different channel. */
   expectedChannelId?: string | undefined;
+  /** When set, assertChannel refuses with it before any request: see Config.lockedReason. */
+  lockedReason?: string | undefined;
   fetch?: typeof fetch;
   logger?: Logger;
 };
@@ -109,6 +111,7 @@ export class YoutubeClient {
   readonly fetchImpl: typeof fetch;
   readonly logger: Logger | undefined;
   private readonly expectedChannelId: string | undefined;
+  private readonly lockedReason: string | undefined;
   private channelPromise: Promise<Channel> | undefined;
 
   constructor(opts: YoutubeClientOptions) {
@@ -119,6 +122,7 @@ export class YoutubeClient {
     this.timeoutMs = opts.timeoutMs;
     this.userAgent = opts.userAgent;
     this.expectedChannelId = opts.expectedChannelId;
+    this.lockedReason = opts.lockedReason;
     this.fetchImpl = opts.fetch ?? fetch;
     this.logger = opts.logger;
   }
@@ -249,6 +253,13 @@ export class YoutubeClient {
 
   /** The channel, after checking it against YOUTUBE_CHANNEL_ID when that is set. */
   async assertChannel(): Promise<Channel> {
+    // Before any request: every data and write tool goes through here (scoped(), and the
+    // upload tool before it sends a byte), so this is the one place a lock has to live.
+    if (this.lockedReason) {
+      throw new PreconditionError(this.lockedReason, {
+        remedy: "Fix the config file (or set YOUTUBE_CHANNEL_ID), then restart the server.",
+      });
+    }
     const channel = await this.channel();
     if (this.expectedChannelId && channel.id !== this.expectedChannelId) {
       throw new PreconditionError(

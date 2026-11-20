@@ -8,7 +8,7 @@ import { oauthTokenProvider, staleness } from "#/client/auth";
 import { SignInRequiredError } from "#/client/errors";
 import { buildAuthorizeUrl, createOAuthClient, OAuthError, startLogin } from "#/client/oauth";
 import { createFileTokenStore, createMemoryTokenStore, TOKEN_FILE_VERSION } from "#/client/tokens";
-import { loadConfig, SCOPE_MANAGE, SCOPE_READONLY } from "#/config";
+import { loadConfig, loadConfigSafely, SCOPE_MANAGE, SCOPE_READONLY } from "#/config";
 import { ABSENT_CONFIG, CHANNEL, CLIENT_ENV, jsonResponse, routedFetch } from "#test/helpers";
 
 const dir = () => mkdtempSync(join(tmpdir(), "mcp-youtube-config-"));
@@ -31,10 +31,104 @@ describe("config", () => {
     expect(config.allowWrites).toBe(false);
   });
 
-  it("rejects an unknown key in the file instead of ignoring it", () => {
+  // Rule 2: a throw here exits the server, which the client shows as "Connection closed".
+  it("reports an unknown key in the file and ignores the whole file, instead of exiting", () => {
     const path = join(dir(), "config.json");
-    writeFileSync(path, JSON.stringify({ clientID: "typo" }), { mode: 0o600 });
-    expect(() => loadConfig({}, path)).toThrow(/clientID/);
+    writeFileSync(path, JSON.stringify({ clientID: "typo", clientSecret: "file-secret" }), {
+      mode: 0o600,
+    });
+    const config = loadConfig({}, path);
+    expect(config.issues.join(" ")).toMatch(/clientID.*whole file was ignored/);
+    // Whole, not field by field: the valid key beside the typo is not used either.
+    expect(config.clientSecret).toBeUndefined();
+  });
+
+  it("clamps out-of-range tuning values and reports them, instead of exiting", () => {
+    const config = loadConfig(
+      { YOUTUBE_MAX_RETRIES: "20", YOUTUBE_TIMEOUT_MS: "0", YOUTUBE_CHUNK_SIZE_MB: "4096" },
+      ABSENT_CONFIG,
+    );
+    expect(config).toMatchObject({ maxRetries: 10, timeoutMs: 1, chunkSizeMb: 1024 });
+    expect(config.issues).toEqual([
+      "YOUTUBE_CHUNK_SIZE_MB=4096 is outside 1-1024; using 1024.",
+      "YOUTUBE_MAX_RETRIES=20 is outside 0-10; using 10.",
+      "YOUTUBE_TIMEOUT_MS=0 is outside 1-2147483647; using 1.",
+    ]);
+  });
+
+  // Review 2026-11-20: a config that loaded before must load identically.
+  it("accepts every value the old schema accepted, with no new issues", () => {
+    const config = loadConfig(
+      { YOUTUBE_TIMEOUT_MS: "500", YOUTUBE_MAX_RETRIES: "0", YOUTUBE_CHUNK_SIZE_MB: "1" },
+      ABSENT_CONFIG,
+    );
+    expect(config).toMatchObject({ timeoutMs: 500, maxRetries: 0, chunkSizeMb: 1 });
+    expect(config.issues).toEqual([]);
+    expect(config.lockedReason).toBeUndefined();
+  });
+
+  it("falls an unreadable environment value through to the file's, as before", () => {
+    const path = join(dir(), "config.json");
+    writeFileSync(path, JSON.stringify({ maxRetries: 5 }), { mode: 0o600 });
+    const config = loadConfig({ YOUTUBE_MAX_RETRIES: "abc" }, path);
+    expect(config.maxRetries).toBe(5);
+    expect(config.issues).toEqual(['YOUTUBE_MAX_RETRIES="abc" is not an integer; using 5.']);
+  });
+
+  it("clamps a config-file tuning value too, naming the file key", () => {
+    const path = join(dir(), "config.json");
+    writeFileSync(path, JSON.stringify({ maxRetries: -1 }), { mode: 0o600 });
+    const config = loadConfig({}, path);
+    expect(config.maxRetries).toBe(0);
+    expect(config.issues).toEqual(["maxRetries (config file)=-1 is outside 0-10; using 0."]);
+  });
+
+  it("reports a non-integer or a non-boolean instead of guessing quietly", () => {
+    const config = loadConfig(
+      { YOUTUBE_MAX_RETRIES: "abc", YOUTUBE_ALLOW_WRITES: "maybe" },
+      ABSENT_CONFIG,
+    );
+    expect(config.maxRetries).toBe(3);
+    expect(config.allowWrites).toBe(false);
+    expect(config.issues).toEqual([
+      'YOUTUBE_ALLOW_WRITES="maybe" is not a boolean (use 1 or 0); treated as off.',
+      'YOUTUBE_MAX_RETRIES="abc" is not an integer; using 3.',
+    ]);
+  });
+
+  // Review 2026-11-20: the file may hold the channel guard, so ignoring it must not widen access.
+  it("locks the data tools when a broken file is ignored and the environment names no channel", () => {
+    const path = join(dir(), "config.json");
+    writeFileSync(
+      path,
+      JSON.stringify({ channelId: "UCaaaaaaaaaaaaaaaaaaaaaa", clientID: "typo" }),
+      {
+        mode: 0o600,
+      },
+    );
+    const env = { ...CLIENT_ENV, YOUTUBE_ALLOW_WRITES: "1" };
+    expect(loadConfig(env, path).lockedReason).toContain("YOUTUBE_CHANNEL_ID");
+    // With the guard in the environment, nothing the file held can widen access.
+    const guarded = loadConfig({ ...env, YOUTUBE_CHANNEL_ID: "UCbbbbbbbbbbbbbbbbbbbbbb" }, path);
+    expect(guarded.lockedReason).toBeUndefined();
+    // A missing file is not a broken one.
+    expect(loadConfig(env, ABSENT_CONFIG).lockedReason).toBeUndefined();
+  });
+
+  it("keeps a malformed channel id, so every call refuses, and says so", () => {
+    const config = loadConfig({ YOUTUBE_CHANNEL_ID: "UC-too-short" }, ABSENT_CONFIG);
+    // Dropping it would silently remove a guard someone set on purpose.
+    expect(config.channelId).toBe("UC-too-short");
+    expect(config.issues.join(" ")).toContain("every data tool refuses");
+  });
+
+  it("starts from safe defaults if loading ever throws", () => {
+    // HOME is unused: a configPath that is a directory makes readFileSync fail with EISDIR,
+    // which loadConfig reports; loadConfigSafely is the backstop for anything it does not.
+    const config = loadConfigSafely({}, dir());
+    expect(config.clientId).toBeUndefined();
+    expect(config.allowWrites).toBe(false);
+    expect(config.issues.length).toBeGreaterThan(0);
   });
 });
 
@@ -179,8 +273,60 @@ describe("the token provider", () => {
     ]);
     expect(tokens).toEqual(["fresh", "fresh", "fresh"]);
     expect(refreshes).toBe(1);
+    // The refreshed token is stored: a guard that always skipped the write would pass the rest.
+    expect(store.read()?.accessToken).toBe("fresh");
     // Google does not rotate refresh tokens; the original must survive.
     expect(store.read()?.refreshToken).toBe("rt");
+  });
+
+  // Found in mcp-google-search-console's review (2026-11-18), which copied this provider.
+  it("does not write a refreshed login back over one made meanwhile", async () => {
+    const store = seed({ channelId: "UCaaaaaaaaaaaaaaaaaaaaaa" });
+    const provider = oauthTokenProvider({
+      store,
+      oauth: {
+        exchangeCode: async () => ({ access_token: "" }),
+        refresh: async () => {
+          // Another window logs in as channel B while this refresh is in flight.
+          const current = store.read();
+          if (current) {
+            store.write({
+              ...current,
+              refreshToken: "rt-B",
+              channelId: "UCbbbbbbbbbbbbbbbbbbbbbb",
+            });
+          }
+          return { access_token: "fresh-A", expires_in: 3600 };
+        },
+        revoke: async () => true,
+      },
+      clientId: CLIENT_ENV.YOUTUBE_CLIENT_ID,
+      requiredScopes: [SCOPE_READONLY],
+    });
+    expect(await provider.getToken()).toBe("fresh-A");
+    expect(store.read()).toMatchObject({
+      refreshToken: "rt-B",
+      channelId: "UCbbbbbbbbbbbbbbbbbbbbbb",
+    });
+  });
+
+  it("does not resurrect a login cleared by a logout during the refresh", async () => {
+    const store = seed();
+    const provider = oauthTokenProvider({
+      store,
+      oauth: {
+        exchangeCode: async () => ({ access_token: "" }),
+        refresh: async () => {
+          store.clear();
+          return { access_token: "fresh-A", expires_in: 3600 };
+        },
+        revoke: async () => true,
+      },
+      clientId: CLIENT_ENV.YOUTUBE_CLIENT_ID,
+      requiredScopes: [SCOPE_READONLY],
+    });
+    await provider.getToken();
+    expect(store.read()).toBeUndefined();
   });
 
   it("treats a read-only login as stale once writes are enabled", () => {

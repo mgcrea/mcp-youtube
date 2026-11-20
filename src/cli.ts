@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { ZodError } from "zod";
 
 import { BUILD_INFO } from "#/build-info";
-import { isConfigured, loadConfig, setupInstructions } from "#/config";
+import { isConfigured, loadConfigSafely, setupInstructions } from "#/config";
 import { createServer } from "#/server";
 
 // Everything goes to stderr: stdout is the MCP protocol channel, and a stray
@@ -33,11 +33,20 @@ const main = async (): Promise<void> => {
   stderrLogger.warn(
     `${BUILD_INFO.name}@${BUILD_INFO.version} (git ${BUILD_INFO.gitCommit} ${BUILD_INFO.gitCommitDate}, node ${process.version})`,
   );
-  const config = loadConfig();
+  const config = loadConfigSafely();
   const { server, client, auth } = createServer({ config, logger: stderrLogger });
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  const status = auth.tokenProvider.describe();
+  // describe() reads the token file, which throws on anything but "missing" (a
+  // directory, no permission). At startup that would exit the server (rule 2),
+  // so report it instead; youtube_auth_status shows the same error on demand.
+  let status: ReturnType<typeof auth.tokenProvider.describe>;
+  try {
+    status = auth.tokenProvider.describe();
+  } catch (err) {
+    stderrLogger.warn(err instanceof Error ? err.message : String(err));
+    status = { signedIn: false, reason: "the token file could not be read" };
+  }
   stderrLogger.warn(
     `youtube-mcp connected (oauth-client=${isConfigured(config) ? "set" : "MISSING"}, ` +
       `signed-in=${status.signedIn ? "yes" : "no"}, ` +
@@ -45,6 +54,8 @@ const main = async (): Promise<void> => {
       `writes=${config.allowWrites ? "ENABLED" : "disabled"}` +
       `${config.channelId ? `, expected-channel=${config.channelId}` : ""})`,
   );
+  for (const issue of config.issues) stderrLogger.warn(`config: ${issue}`);
+  if (config.lockedReason) stderrLogger.warn(`LOCKED: ${config.lockedReason}`);
   for (const line of setupInstructions(config)) stderrLogger.warn(line);
 
   // The token picks the channel, so say which one — after connect, and not

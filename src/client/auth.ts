@@ -86,7 +86,16 @@ export const oauthTokenProvider = (opts: {
           ? { channel: { id: tokens.channelId, title: tokens.channelTitle ?? "" } }
           : {}),
       });
-      opts.store.write(next);
+      // The store may have changed while the refresh was in flight: a login
+      // (here or in another editor window sharing the token file) wrote a new
+      // channel, or a logout cleared it. Writing this result back would undo
+      // that, resurrecting a revoked login. Use the token for this one call,
+      // but leave the store alone. Found in mcp-google-search-console's review
+      // (2026-11-18), which copied this provider from here.
+      const latest = opts.store.read();
+      if (latest?.refreshToken === tokens.refreshToken && latest.clientId === tokens.clientId) {
+        opts.store.write(next);
+      }
       return next.accessToken as string;
     } catch (err) {
       if (err instanceof OAuthError && err.code === "invalid_grant") {

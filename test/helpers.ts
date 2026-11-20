@@ -122,9 +122,12 @@ export const tempFile = (name: string, bytes: number | Uint8Array): string => {
 
 export const connect = async (
   env: Record<string, string> = CLIENT_ENV,
-  opts: { routes?: Route[]; tokenProvider?: TokenProvider } = {},
+  opts: { routes?: Route[]; tokenProvider?: TokenProvider; configPath?: string } = {},
 ) => {
-  const config: Config = loadConfig({ ...env, HOME: "/nonexistent" }, ABSENT_CONFIG);
+  const config: Config = loadConfig(
+    { ...env, HOME: "/nonexistent" },
+    opts.configPath ?? ABSENT_CONFIG,
+  );
   const { fetch, calls } = routedFetch([...(opts.routes ?? []), channelRoute]);
   const { server, uploads } = createServer({
     config,
